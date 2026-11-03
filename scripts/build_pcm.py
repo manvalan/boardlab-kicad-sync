@@ -1,7 +1,7 @@
 """Build the KiCad PCM package zip and the metadata.json for the official KiCad metadata repository.
 
 Usage: python3 scripts/build_pcm.py 26.10.5
-Writes pcm/boardlab-sync-<version>.zip (upload it as a GitHub release asset, tag v<version>) and
+Writes pcm/boardlab-sync-<version>.zip (copy it to dist/ and push tag v<version>) and
 pcm/metadata-repo/packages/it.boardlab.sync/metadata.json (submit it to gitlab.com/kicad/addons/metadata).
 """
 import hashlib, io, json, os, sys, zipfile
@@ -50,7 +50,7 @@ with open(os.path.join(ROOT, "pcm", f"boardlab-sync-{V}.zip"), "wb") as fh:
 with zipfile.ZipFile(io.BytesIO(data)) as z:
     install = sum(i.file_size for i in z.infolist())
 v = meta["versions"][0]
-v.update(download_url=f"{REPO}/releases/download/v{V}/boardlab-sync-{V}.zip",
+v.update(download_url=f"https://raw.githubusercontent.com/manvalan/boardlab-kicad-sync/v{V}/dist/boardlab-sync-{V}.zip",
          download_sha256=hashlib.sha256(data).hexdigest(), download_size=len(data), install_size=install)
 out = os.path.join(ROOT, "pcm", "metadata-repo", "packages", meta["identifier"])
 os.makedirs(out, exist_ok=True)

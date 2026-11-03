@@ -13,7 +13,7 @@ The plugin is only a client: the review runs on boardlab.it and needs an account
 
 ## Install
 
-From KiCad 10: **Plugin and Content Manager**, search "BoardLab Sync", Install. Or download the zip from the [Releases](../../releases) page and use **Install from File...** without unzipping it.
+From KiCad 10: **Plugin and Content Manager**, search "BoardLab Sync", Install. Or download the zip from [dist/](dist/) and use **Install from File...** without unzipping it.
 
 If KiCad asks, enable **Preferences > Plugins > Enable KiCad API**. On first run KiCad installs `kicad-python` in the plugin's own Python environment (needs internet). Linux (Debian, Ubuntu): `sudo apt install python3-venv`, then restart KiCad.
 
