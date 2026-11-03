@@ -1,0 +1,84 @@
+{
+  "$schema": "https://go.kicad.org/api/schemas/v1",
+  "identifier": "it.boardlab.sync",
+  "name": "BoardLab Sync",
+  "description": "Link this board to a BoardLab project: receive BoardLab's changes and findings, send the board back.",
+  "runtime": {
+    "type": "python",
+    "min_version": "3.10"
+  },
+  "actions": [
+    {
+      "identifier": "link",
+      "name": "BoardLab: Link",
+      "description": "Link this board to a BoardLab project (you confirm the project on boardlab.it)",
+      "show-button": true,
+      "scopes": [
+        "pcb"
+      ],
+      "entrypoint": "link.py",
+      "icons-light": [
+        "icons/link.png",
+        "icons/link@2x.png"
+      ],
+      "icons-dark": [
+        "icons/link.png",
+        "icons/link@2x.png"
+      ]
+    },
+    {
+      "identifier": "pull-changes",
+      "name": "BoardLab: Receive changes",
+      "description": "Apply BoardLab's changes to this board as one undo step",
+      "show-button": true,
+      "scopes": [
+        "pcb"
+      ],
+      "entrypoint": "pull_changes.py",
+      "icons-light": [
+        "icons/pull-changes.png",
+        "icons/pull-changes@2x.png"
+      ],
+      "icons-dark": [
+        "icons/pull-changes.png",
+        "icons/pull-changes@2x.png"
+      ]
+    },
+    {
+      "identifier": "pull-findings",
+      "name": "BoardLab: Receive findings",
+      "description": "Pin BoardLab's open findings as notes on User.Comments",
+      "show-button": true,
+      "scopes": [
+        "pcb"
+      ],
+      "entrypoint": "pull_findings.py",
+      "icons-light": [
+        "icons/pull-findings.png",
+        "icons/pull-findings@2x.png"
+      ],
+      "icons-dark": [
+        "icons/pull-findings.png",
+        "icons/pull-findings@2x.png"
+      ]
+    },
+    {
+      "identifier": "push-board",
+      "name": "BoardLab: Send board",
+      "description": "Send this board and the schematic saved next to it (all sheets) to the linked BoardLab project",
+      "show-button": true,
+      "scopes": [
+        "pcb"
+      ],
+      "entrypoint": "push_board.py",
+      "icons-light": [
+        "icons/push-board.png",
+        "icons/push-board@2x.png"
+      ],
+      "icons-dark": [
+        "icons/push-board.png",
+        "icons/push-board@2x.png"
+      ]
+    }
+  ]
+}
