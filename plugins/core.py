@@ -107,6 +107,103 @@ def copper_difference(change: dict, board: BoardSnapshot) -> tuple[list[tuple], 
     return sorted((want - have).elements()), sorted((have - want).elements())
 
 
+def track_key(net, layer, x1, y1, x2, y2, width) -> tuple:
+    """One track as compared between the plan and the board (and remembered between updates)."""
+    return _track_key(net, layer, x1, y1, x2, y2, width)
+
+
+def via_key(net, x, y, diameter, drill) -> tuple:
+    return ("via", net, _snap(x), _snap(y), _snap(diameter), _snap(drill))
+
+
+def _change_keys(change: dict) -> tuple[list[tuple[tuple, dict]], list[tuple[tuple, dict]]]:
+    tracks = [(track_key(t["net"], t["layer"], *t["start"], *t["end"], t["width"]), t) for t in change.get("tracks", [])]
+    vias = [(via_key(v["net"], *v["at"], v["diameter"], v["drill"]), v) for v in change.get("vias", [])]
+    return tracks, vias
+
+
+def remembered(keys) -> set[tuple]:
+    """Keys saved as JSON lists (links.json) back to tuples."""
+    return {tuple(k) for k in keys or []}
+
+
+@dataclass
+class BoardUpdate:
+    """What "Update board" does to the open board, worked out before anything is written.
+
+    * ``moves``: the footprints not yet where BoardLab puts them.
+    * ``add_tracks`` / ``add_vias``: the plan's copper the board does not have yet (copper already
+      there is left untouched, not removed and drawn again).
+    * ``stale``: copper on the plan's nets that an earlier update put there and the plan no longer
+      has (the router changed its mind): removed.
+    * ``local``: the designer's own copper on the plan's nets (not from an earlier update): kept,
+      unless the designer chooses to replace it.
+    * ``plan_keys``: every piece of the plan's copper, remembered so the next update can tell
+      BoardLab's copper from the designer's.
+    Board copper is given as (key, item) pairs, the item being whatever the caller removes."""
+    moves: list[dict] = field(default_factory=list)
+    add_tracks: list[dict] = field(default_factory=list)
+    add_vias: list[dict] = field(default_factory=list)
+    stale: list = field(default_factory=list)
+    local: list = field(default_factory=list)
+    plan_keys: list[tuple] = field(default_factory=list)
+
+    @property
+    def nothing_to_do(self) -> bool:
+        return not (self.moves or self.add_tracks or self.add_vias or self.stale)
+
+
+def plan_update(change: dict, board: BoardSnapshot, copper: list[tuple[tuple, object]],
+                applied_before: set[tuple]) -> BoardUpdate:
+    """Compare the changeset with the open board. ``copper`` is the board's copper on the plan's
+    nets as (key, item); ``applied_before`` the keys an earlier update of this board put there."""
+    tracks, vias = _change_keys(change)
+    want = Counter(k for k, _ in tracks + vias)
+    have = Counter(k for k, _ in copper)
+    up = BoardUpdate(moves=footprint_moves(change, board), plan_keys=sorted(want.elements()))
+    spare = Counter(have)
+    for key, t in tracks:
+        if spare[key] > 0:
+            spare[key] -= 1
+        else:
+            up.add_tracks.append(t)
+    for key, v in vias:
+        if spare[key] > 0:
+            spare[key] -= 1
+        else:
+            up.add_vias.append(v)
+    keep = Counter(want)
+    for key, item in copper:
+        if keep[key] > 0:
+            keep[key] -= 1
+        elif key in applied_before:
+            up.stale.append(item)
+        else:
+            up.local.append(item)
+    return up
+
+
+def preview_text(change: dict, up: BoardUpdate, backup: str | None) -> str:
+    """The preview shown before the board is touched."""
+    lines = [f"\"{change.get('title', 'BoardLab changes')}\" on this board:"]
+    if up.moves:
+        names = ", ".join(fp["ref"] for fp in up.moves[:12]) + (" ..." if len(up.moves) > 12 else "")
+        lines.append(f"- move {len(up.moves)} parts: {names}")
+    if up.add_tracks or up.add_vias:
+        nets = {t["net"] for t in up.add_tracks} | {v["net"] for v in up.add_vias}
+        lines.append(f"- add {len(up.add_tracks)} tracks and {len(up.add_vias)} vias on {len(nets)} nets")
+    if up.stale:
+        lines.append(f"- remove {len(up.stale)} tracks and vias that an earlier BoardLab update put there "
+                     "and the new routing no longer uses")
+    if up.local:
+        lines.append(f"- your own {len(up.local)} tracks and vias on these nets are KEPT (run DRC after); "
+                     "choose \"Replace mine\" to remove them instead")
+    lines.append("Nothing else on the board changes. Ctrl+Z undoes it all in one step.")
+    if backup:
+        lines.append(f"A copy of the board as it is now is saved first in {backup}")
+    return "\n".join(lines)
+
+
 def copper_is_current(change: dict, board: BoardSnapshot) -> bool:
     """True when every piece of the changeset's copper is already on the board, so applying it again
     would only churn the undo history and the team's diary. Other copper on those nets (the designer's

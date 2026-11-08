@@ -5,7 +5,7 @@ Links a board open in the KiCad PCB editor to a BoardLab project, both ways:
 | Button | What it does |
 |---|---|
 | BoardLab: Link | Opens boardlab.it with a short code; you pick the project and confirm there. |
-| BoardLab: Receive changes | Applies BoardLab's changes (the saved DDR plan) to the open board as one undo step (Ctrl+Z). Refused, with the reason, when the board is not the one the plan was made for. |
+| BoardLab: Update board | Brings BoardLab's placement and routing (the saved DDR plan) into the open board. A preview says what will change; a copy of the board is saved in `boardlab-backups/` next to it; then only the changes are written, as one undo step (Ctrl+Z): parts not yet in place are moved, missing tracks and vias are added, and tracks or vias an earlier update put there and the new routing dropped are removed. Your own tracks and vias are kept unless you press "Replace mine". Refused, with the reason, when the board is not the one the plan was made for. |
 | BoardLab: Receive findings | Pins the open findings as notes on User.Comments (a ring and a text). Each run replaces the previous BoardLab notes. |
 | BoardLab: Send board | Sends the board as it is open now, and the schematic saved in the same folder (all hierarchical sheets), to the linked project. KiCad 10 gives plugins no schematic editor, so save the schematic first. |
 

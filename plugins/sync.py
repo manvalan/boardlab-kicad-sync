@@ -183,8 +183,51 @@ def action_link() -> None:
     raise SystemExit("BoardLab: the link was not confirmed in time; press \"BoardLab: Link\" again.")
 
 
+KEEP_MINE = "Update board"
+REPLACE_MINE = "Replace mine"
+BACKUPS_KEPT = 10
+
+
+def _copper_key(item) -> tuple:
+    if isinstance(item, Via):
+        return core.via_key(item.net.name, item.position.x, item.position.y, item.diameter, item.drill_diameter)
+    return core.track_key(item.net.name, canonical_name(item.layer), item.start.x, item.start.y,
+                          item.end.x, item.end.y, item.width)
+
+
+def _backup_folder(board) -> Path:
+    try:
+        folder = Path(board.get_project().path)
+    except Exception:
+        folder = None
+    if folder and folder.is_dir():
+        return folder / "boardlab-backups"  # "-backups": Send board leaves it out, as KiCad's own
+    return launcher.config_dir() / "backups"
+
+
+def _backup(board, folder: Path) -> Path:
+    """The board as it is open now (saved or not), before BoardLab touches it; the last
+    BACKUPS_KEPT copies of each board are kept."""
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = Path(str(board.name or "board")).stem
+    path = folder / f"{stem}-before-boardlab-{time.strftime('%Y%m%d-%H%M%S')}.kicad_pcb"
+    path.write_text(board.get_as_string(), encoding="utf-8")
+    for old in sorted(folder.glob(f"{stem}-before-boardlab-*.kicad_pcb"))[:-BACKUPS_KEPT]:
+        try:
+            old.unlink()
+        except OSError:
+            pass
+    return path
+
+
 def action_pull_changes() -> None:
-    """Apply BoardLab's changes (today: the saved DDR plan) to the open board as one undo step."""
+    """Update the open board with BoardLab's placement and routing (today: the saved DDR plan).
+
+    Only what changed is written: the parts not yet where BoardLab puts them are moved, the plan's
+    tracks and vias the board does not have are added, and the copper an earlier update put there
+    and the new routing dropped is removed. The designer's own copper is kept unless they choose
+    otherwise. A preview comes first and a copy of the board is saved before the one undoable
+    commit."""
     kicad, board = _board()
     link = _link_for(board)
     change = _call(link["server"], "GET", f"/api/v2/boards/{link['project_id']}/kicad/changeset", token=link["token"])
@@ -194,22 +237,34 @@ def action_pull_changes() -> None:
         raise SystemExit("BoardLab: nothing changed.\n- " + "\n- ".join(problems))
     nets = {n.name: n for n in board.get_nets()}
     replace = set(change.get("replace_copper_of_nets", []))
-    old = [i for i in list(board.get_tracks()) + list(board.get_vias()) if i.net.name in replace]
-    moves = core.footprint_moves(change, snap)
-    for i in old:
-        if isinstance(i, Via):
-            snap.vias.append((i.net.name, i.position.x, i.position.y, i.diameter, i.drill_diameter))
-        else:
-            snap.tracks.append((i.net.name, canonical_name(i.layer), i.start.x, i.start.y, i.end.x, i.end.y, i.width))
-    missing, extra = core.copper_difference(change, snap)
-    if not moves and not missing:
-        say(f"BoardLab: the board already has \"{change.get('title', 'BoardLab changes')}\"; nothing to apply."
-            + (f" {len(extra)} other tracks or vias on the plan's nets are left as they are." if extra else ""))
+    copper = [(_copper_key(i), i) for i in list(board.get_tracks()) + list(board.get_vias()) if i.net.name in replace]
+    key = _board_key(board)
+    applied = core.remembered((link.get("applied") or {}).get("copper"))
+    up = core.plan_update(change, snap, copper, applied)
+    title = change.get("title", "BoardLab changes")
+
+    def remember() -> None:
+        link["applied"] = {"title": title, "at": int(time.time()), "copper": [list(k) for k in up.plan_keys]}
+        _save_link(key, link)
+
+    if up.nothing_to_do:
+        remember()  # a board updated by an older plugin: from now on its BoardLab copper is known
+        say(f"BoardLab: the board already has \"{title}\"; nothing to update."
+            + (f" Your {len(up.local)} other tracks or vias on the plan's nets are left as they are." if up.local else ""))
         return
+
+    folder = _backup_folder(board)
+    choices = [KEEP_MINE, REPLACE_MINE] if up.local else [KEEP_MINE]
+    answer = launcher.ask(core.preview_text(change, up, str(folder)), choices)
+    if answer is None:
+        say("BoardLab: update cancelled, the board is unchanged.")
+        return
+    backup = _backup(board, folder)
+    remove = up.stale + (up.local if answer == REPLACE_MINE else [])
     by_ref = {fp.reference_field.text.value: fp for fp in board.get_footprints()}
 
     tracks = []
-    for t in change.get("tracks", []):
+    for t in up.add_tracks:
         track = Track()
         track.start = Vector2.from_xy(*t["start"])
         track.end = Vector2.from_xy(*t["end"])
@@ -218,7 +273,7 @@ def action_pull_changes() -> None:
         track.net = nets[t["net"]]
         tracks.append(track)
     vias = []
-    for v in change.get("vias", []):
+    for v in up.add_vias:
         via = Via()
         via.position = Vector2.from_xy(*v["at"])
         via.diameter = int(v["diameter"])
@@ -229,10 +284,10 @@ def action_pull_changes() -> None:
 
     commit = board.begin_commit()
     try:
-        if old:
-            board.remove_items(old)
+        if remove:
+            board.remove_items(remove)
         moved = []
-        for fp in moves:
+        for fp in up.moves:
             item = by_ref[fp["ref"]]
             item.orientation = Angle.from_degrees(float(fp["to"]["angle_deg"]))  # turns about its anchor
             item.position = Vector2.from_xy(int(fp["to"]["x"]), int(fp["to"]["y"]))
@@ -244,11 +299,13 @@ def action_pull_changes() -> None:
     except Exception:
         board.drop_commit(commit)
         raise
-    title = change.get("title", "BoardLab changes")
     board.push_commit(commit, title)
-    summary = (f"Removed {len(old)} old tracks and vias, moved {len(moves)} parts, "
-               f"added {len(tracks)} tracks and {len(vias)} vias on {len(replace)} nets.")
-    say(f"BoardLab: applied \"{title}\". {summary} Ctrl+Z undoes it all.")
+    remember()
+    kept = len(up.local) if answer != REPLACE_MINE else 0
+    summary = (f"Moved {len(up.moves)} parts, added {len(tracks)} tracks and {len(vias)} vias, "
+               f"removed {len(remove)} old tracks and vias" + (f", kept {kept} of the designer's" if kept else "")
+               + f" on {len(replace)} nets.")
+    say(f"BoardLab: applied \"{title}\". {summary} Ctrl+Z undoes it all. Backup: {backup}")
     for note in change.get("notes", []):
         say("  " + note)
     _call(link["server"], "POST", f"/api/v2/boards/{link['project_id']}/kicad/applied", token=link["token"],
