@@ -78,6 +78,66 @@ def alert(message: str, *, ok: bool = False) -> None:
         log(f"dialog failed: {type(exc).__name__}: {exc}")
 
 
+def ask(message: str, choices: list[str]) -> str | None:
+    """Ask the designer to pick one of ``choices`` (the first is the default) or Cancel; ``None`` is
+    Cancel. With no dialog available (BOARDLAB_SYNC_NO_DIALOG, a Linux without zenity or kdialog)
+    the answer is BOARDLAB_SYNC_ANSWER, else the default: the caller saves a backup first and the
+    change is one Ctrl+Z, so a missing dialog never blocks the designer."""
+    title = "BoardLab Sync"
+    text = message if len(message) < 1800 else message[:1800] + " ..."
+    fallback = os.environ.get("BOARDLAB_SYNC_ANSWER") or choices[0]
+    fallback = None if fallback.lower() == "cancel" else fallback
+    if os.environ.get("BOARDLAB_SYNC_NO_DIALOG"):
+        log(f"ask (no dialog): {fallback}")
+        return fallback
+    try:
+        if sys.platform == "darwin":
+            buttons = ["Cancel"] + list(reversed(choices))  # the default sits on the right
+            script = ("on run argv\n"
+                      "activate\n"
+                      "set b to {" + ", ".join(f"item {i + 3} of argv" for i in range(len(buttons))) + "}\n"
+                      "display dialog (item 2 of argv) with title (item 1 of argv) buttons b "
+                      "default button (item 3 of argv) cancel button \"Cancel\" with icon note\n"
+                      "return button returned of result\n"
+                      "end run")
+            got = subprocess.run(["osascript", "-e", script, title, text, choices[0], *buttons],
+                                 timeout=1800, check=False, capture_output=True, text=True)
+            picked = got.stdout.strip()
+            return picked if got.returncode == 0 and picked in choices else None
+        if sys.platform == "win32":
+            import ctypes
+            if len(choices) == 1:
+                body = text + f"\n\nOK = {choices[0]}"
+                r = ctypes.windll.user32.MessageBoxW(None, body, title, 0x1 | 0x40)  # OK / Cancel
+                return choices[0] if r == 1 else None
+            body = text + f"\n\nYes = {choices[0]}\nNo = {choices[1]}"
+            r = ctypes.windll.user32.MessageBoxW(None, body, title, 0x3 | 0x40)  # Yes / No / Cancel
+            return {6: choices[0], 7: choices[1]}.get(r)
+        try:
+            cmd = ["zenity", "--question", "--title", title, "--text", text, "--ok-label", choices[0],
+                   "--cancel-label", "Cancel"] + [a for c in choices[1:] for a in ("--extra-button", c)]
+            got = subprocess.run(cmd, timeout=1800, check=False, capture_output=True, text=True)
+            if got.returncode == 0:
+                return choices[0]
+            return got.stdout.strip() if got.stdout.strip() in choices else None
+        except FileNotFoundError:
+            pass
+        try:
+            if len(choices) == 1:
+                cmd = ["kdialog", "--title", title, "--yesno", text, "--yes-label", choices[0], "--no-label", "Cancel"]
+            else:
+                cmd = ["kdialog", "--title", title, "--yesnocancel", text, "--yes-label", choices[0],
+                       "--no-label", choices[1], "--cancel-label", "Cancel"]
+            got = subprocess.run(cmd, timeout=1800, check=False, capture_output=True)
+            return {0: choices[0], 1: choices[1] if len(choices) > 1 else None}.get(got.returncode)
+        except FileNotFoundError:
+            pass
+    except Exception as exc:
+        log(f"question dialog failed: {type(exc).__name__}: {exc}")
+    log(f"ask (no dialog available): {fallback}")
+    return fallback
+
+
 def other_copy_note() -> str | None:
     """A second BoardLab Sync left in KiCad's plugins folder (a hand-unzipped copy from before the
     Plugin and Content Manager package) next to the installed package: KiCad may run either one."""

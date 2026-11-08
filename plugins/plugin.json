@@ -28,8 +28,8 @@
     },
     {
       "identifier": "pull-changes",
-      "name": "BoardLab: Receive changes",
-      "description": "Apply BoardLab's changes to this board as one undo step",
+      "name": "BoardLab: Update board",
+      "description": "Bring BoardLab's placement and routing into this board: preview, backup, one undo step; your own copper is kept",
       "show-button": true,
       "scopes": [
         "pcb"
