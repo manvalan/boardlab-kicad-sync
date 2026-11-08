@@ -9,6 +9,8 @@ KiCad 10 plugin (IPC API) that links the board open in the PCB editor to a proje
 | BoardLab: Receive findings | Pins the open findings as notes on User.Comments (a ring and a text). Each run replaces the previous BoardLab notes. |
 | BoardLab: Update board | Brings BoardLab's placement and routing (e.g. a saved DDR plan) back into the open board. A preview says what will change and a copy of the board is saved in `boardlab-backups/` first; then only the changes are written, as one undo step. Your own tracks and vias are kept unless you choose "Replace mine". Refused, with the reason, when the board does not match. |
 
+When a new version is out, the plugin offers "Update now" after a button press (once a day at most): it downloads the package from boardlab.it, checks its checksum and replaces its own files. Set `BOARDLAB_SYNC_NO_UPDATE_CHECK=1` to turn this off.
+
 The plugin is only a client: the review runs on boardlab.it and needs an account (the first board up to 30 ICs is free). A plugin never reaches a project without your confirmation on the website.
 
 ## Install
