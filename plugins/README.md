@@ -22,4 +22,6 @@ Linux (Debian, Ubuntu): KiCad builds that environment with the system Python, wh
 
 Messages appear in the PCB editor's message panel (bottom right of the status bar). When an action fails, a dialog says why, and every message is also written to `boardlab-sync.log` next to the links file.
 
+**New versions.** Once a day at most, after a button press, the plugin asks boardlab.it for the newest version (`/api/v2/plugins/latest`). When there is one it offers "Update now": the package is downloaded, its checksum checked, and the plugin replaces its own files; your boards and links are not touched. Cancel asks again the next day. The next button press runs the new version; restart KiCad when the update adds or renames buttons. Set `BOARDLAB_SYNC_NO_UPDATE_CHECK=1` to turn the check off.
+
 The links (one per board file) are kept in `boardlab-sync/links.json` in your user configuration folder. Set `BOARDLAB_URL` to use another BoardLab server.

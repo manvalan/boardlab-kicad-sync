@@ -14,6 +14,8 @@ from collections import Counter
 from pathlib import Path
 from dataclasses import dataclass, field
 
+PLUGIN_VERSION = "26.11.3"  # calendar versioning; the PCM package and GET /plugins/latest read it from here
+PACKAGE_ID = "it.boardlab.sync"
 CHANGESET_FORMAT = "boardlab-kicad-changeset"
 FINDINGS_FORMAT = "boardlab-kicad-findings"
 POSITION_TOLERANCE_NM = 10_000  # 10 um: KiCad stores positions to the nanometre, files to 1e-4 mm
@@ -50,20 +52,32 @@ def _mm(nm: int) -> str:
     return f"{nm / 1e6:.3f}"
 
 
+SUPPORTED_VERSIONS = (1, 2)  # 1: one DDR plan; 2: the Layout page's approved changes (several anchors, zones)
+ZONE_MARK = "BoardLab "  # every zone BoardLab draws is named so: the plugin replaces only its own
+
+
+def anchors_of(change: dict) -> list[dict]:
+    return ([change["anchor"]] if change.get("anchor") else []) + list(change.get("anchors") or [])
+
+
 def check_changeset(change: dict, board: BoardSnapshot) -> list[str]:
     """Reasons the changeset cannot go on this board; empty when it can."""
-    if change.get("format") != CHANGESET_FORMAT or int(change.get("version", 0)) != 1:
+    if change.get("format") != CHANGESET_FORMAT or int(change.get("version", 0)) not in SUPPORTED_VERSIONS:
         return ["This BoardLab Sync is too old for the changes BoardLab sent: update the plugin."]
     problems: list[str] = []
-    anchor = change["anchor"]
-    ref = anchor["ref"]
-    if ref not in board.footprints:
-        problems.append(f"{ref} is not on this board: open the board that was uploaded to BoardLab.")
-    elif not _at(board.footprints[ref], anchor):
-        x, y, a = board.footprints[ref]
-        problems.append(f"{ref} moved since the upload (now {_mm(x)}, {_mm(y)} mm at {a:g} deg, the plan expects "
-                        f"{_mm(anchor['x'])}, {_mm(anchor['y'])} mm at {anchor.get('angle_deg', 0):g} deg): "
-                        "send the board to BoardLab and plan again.")
+    for anchor in anchors_of(change):
+        ref = anchor["ref"]
+        if ref not in board.footprints:
+            problems.append(f"{ref} is not on this board: open the board that was uploaded to BoardLab.")
+        elif not _at(board.footprints[ref], anchor):
+            x, y, a = board.footprints[ref]
+            problems.append(f"{ref} moved since the upload (now {_mm(x)}, {_mm(y)} mm at {a:g} deg, the plan expects "
+                            f"{_mm(anchor['x'])}, {_mm(anchor['y'])} mm at {anchor.get('angle_deg', 0):g} deg): "
+                            "send the board to BoardLab and plan again.")
+    for z in change.get("zones", []):
+        if not str(z.get("name", "")).startswith(ZONE_MARK) or len(z.get("outline") or []) < 3:
+            problems.append("A zone BoardLab sent has no BoardLab name or no outline: update the plugin.")
+            break
     for fp in change.get("footprints", []):
         where = board.footprints.get(fp["ref"])
         if where is None:
@@ -147,10 +161,33 @@ class BoardUpdate:
     stale: list = field(default_factory=list)
     local: list = field(default_factory=list)
     plan_keys: list[tuple] = field(default_factory=list)
+    add_zones: list[dict] = field(default_factory=list)  # BoardLab zones the board lacks (or has with another outline)
+    remove_zones: list = field(default_factory=list)  # BoardLab zones to take off: replaced, or dropped by the plan
 
     @property
     def nothing_to_do(self) -> bool:
-        return not (self.moves or self.add_tracks or self.add_vias or self.stale)
+        return not (self.moves or self.add_tracks or self.add_vias or self.stale or self.add_zones or self.remove_zones)
+
+
+def zone_key(name: str, outline) -> tuple:
+    """One zone as compared between the plan and the board: its name and outline on the 10 um grid."""
+    return (name, tuple((_snap(x), _snap(y)) for x, y in outline))
+
+
+def zone_update(change: dict, board_zones: list[tuple[str, list, object]], applied_before: set[str]) -> tuple[list[dict], list]:
+    """(zones to add, board zone items to remove). ``board_zones`` are the board's zones named by BoardLab
+    as (name, outline in nm, item). A zone of the plan already there with the same outline is kept; one
+    with the same name and another outline is replaced; a BoardLab zone an earlier update put there and
+    the plan no longer has is removed. A zone named "BoardLab ..." that no update put there is left alone."""
+    want = {z["name"]: z for z in change.get("zones", [])}
+    have = {}
+    remove = []
+    for name, outline, item in board_zones:
+        if name in want and zone_key(name, outline) == zone_key(name, want[name]["outline"]) and name not in have:
+            have[name] = item
+        elif name in want or name in applied_before:
+            remove.append(item)
+    return [z for n, z in want.items() if n not in have], remove
 
 
 def plan_update(change: dict, board: BoardSnapshot, copper: list[tuple[tuple, object]],
@@ -186,6 +223,12 @@ def plan_update(change: dict, board: BoardSnapshot, copper: list[tuple[tuple, ob
 def preview_text(change: dict, up: BoardUpdate, backup: str | None) -> str:
     """The preview shown before the board is touched."""
     lines = [f"\"{change.get('title', 'BoardLab changes')}\" on this board:"]
+    listed = change.get("changes") or []
+    if len(listed) > 1 or (listed and listed[0].get("title") != change.get("title")):
+        lines.append("Approved on BoardLab's Layout page, in this order:")
+        for i, c in enumerate(listed, 1):
+            what = ", ".join(f"{c[k]} {k}" for k in ("footprints", "tracks", "vias", "zones") if c.get(k))
+            lines.append(f"  {i}. {c.get('title', c.get('kind', ''))}" + (f" ({what})" if what else ""))
     if up.moves:
         names = ", ".join(fp["ref"] for fp in up.moves[:12]) + (" ..." if len(up.moves) > 12 else "")
         lines.append(f"- move {len(up.moves)} parts: {names}")
@@ -195,6 +238,10 @@ def preview_text(change: dict, up: BoardUpdate, backup: str | None) -> str:
     if up.stale:
         lines.append(f"- remove {len(up.stale)} tracks and vias that an earlier BoardLab update put there "
                      "and the new routing no longer uses")
+    if up.add_zones:
+        lines.append(f"- add {len(up.add_zones)} keep-out areas: " + ", ".join(z["name"] for z in up.add_zones[:6]))
+    if up.remove_zones:
+        lines.append(f"- remove {len(up.remove_zones)} BoardLab keep-out areas that the changes replace or no longer have")
     if up.local:
         lines.append(f"- your own {len(up.local)} tracks and vias on these nets are KEPT (run DRC after); "
                      "choose \"Replace mine\" to remove them instead")
@@ -277,3 +324,66 @@ def schematic_zip(folder: Path) -> tuple[bytes, int]:
             zf.write(path, rel.as_posix())
             count += path.name.lower().endswith(".kicad_sch")
     return buf.getvalue(), count
+
+
+# -- new versions -------------------------------------------------------------------------------
+
+UPDATE_CHECK_EVERY_S = 24 * 3600  # one look at the server a day at most
+UPDATE_SNOOZE_S = 24 * 3600  # "Later" asks again the next day
+
+
+def version_tuple(v: str) -> tuple[int, ...]:
+    out = []
+    for part in str(v or "").split("."):
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
+
+
+def is_newer(latest: str, current: str) -> bool:
+    return bool(latest) and version_tuple(latest) > version_tuple(current)
+
+
+def update_due(state: dict, now: float) -> bool:
+    """Time to ask the server again (state is the remembered update.json)."""
+    return now - float(state.get("checked_at", 0)) >= UPDATE_CHECK_EVERY_S
+
+
+def should_offer(latest: str, current: str, state: dict, now: float) -> bool:
+    """A newer version the designer has not put off ("Later") in the last day."""
+    if not is_newer(latest, current):
+        return False
+    return not (state.get("snoozed_version") == latest and now < float(state.get("snoozed_until", 0)))
+
+
+def package_files(data: bytes, expected_sha256: str | None = None) -> dict[str, bytes]:
+    """The plugin files (relative path -> bytes) of a downloaded PCM package, checked before anything
+    is written: the checksum the server published, this plugin's identifier, a plugin.json, and no
+    path that leaves the plugin folder."""
+    import hashlib
+    import json as _json
+
+    if expected_sha256 and hashlib.sha256(data).hexdigest() != expected_sha256.lower():
+        raise ValueError("the download is damaged (checksum differs): nothing was changed")
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise ValueError("the download is not a plugin package: nothing was changed") from None
+    try:
+        meta = _json.loads(zf.read("metadata.json"))
+    except (KeyError, ValueError):
+        raise ValueError("the package has no metadata.json: nothing was changed") from None
+    if meta.get("identifier") != PACKAGE_ID:
+        raise ValueError(f"the package is {meta.get('identifier')!r}, not BoardLab Sync: nothing was changed")
+    files: dict[str, bytes] = {}
+    for name in zf.namelist():
+        top, _, rest = name.partition("/")
+        if top != "plugins" or not rest or name.endswith("/"):
+            continue
+        parts = rest.split("/")
+        if rest.startswith("/") or "\\" in rest or any(p in ("", ".", "..") for p in parts) or ":" in parts[0]:
+            raise ValueError(f"the package has an unsafe path ({name}): nothing was changed")
+        files[rest] = zf.read(name)
+    if "plugin.json" not in files or "sync.py" not in files:
+        raise ValueError("the package has no plugin.json or sync.py: nothing was changed")
+    return files

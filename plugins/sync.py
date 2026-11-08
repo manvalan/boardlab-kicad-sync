@@ -18,9 +18,9 @@ from pathlib import Path
 import core
 import launcher
 from kipy import KiCad
-from kipy.board_types import BoardCircle, BoardText, Track, Via
-from kipy.geometry import Angle, Vector2
-from kipy.proto.board.board_types_pb2 import BoardLayer, PadStackShape
+from kipy.board_types import BoardCircle, BoardText, Track, Via, Zone
+from kipy.geometry import Angle, PolygonWithHoles, PolyLineNode, Vector2
+from kipy.proto.board.board_types_pb2 import BoardLayer, PadStackShape, ZoneType
 from kipy.util.board_layer import (
     canonical_name,
     is_copper_layer,
@@ -241,10 +241,13 @@ def action_pull_changes() -> None:
     key = _board_key(board)
     applied = core.remembered((link.get("applied") or {}).get("copper"))
     up = core.plan_update(change, snap, copper, applied)
+    applied_zones = set((link.get("applied") or {}).get("zones") or [])
+    up.add_zones, up.remove_zones = core.zone_update(change, _boardlab_zones(board), applied_zones)
     title = change.get("title", "BoardLab changes")
 
     def remember() -> None:
-        link["applied"] = {"title": title, "at": int(time.time()), "copper": [list(k) for k in up.plan_keys]}
+        link["applied"] = {"title": title, "at": int(time.time()), "copper": [list(k) for k in up.plan_keys],
+                           "zones": sorted(z["name"] for z in change.get("zones", []))}
         _save_link(key, link)
 
     if up.nothing_to_do:
@@ -260,7 +263,7 @@ def action_pull_changes() -> None:
         say("BoardLab: update cancelled, the board is unchanged.")
         return
     backup = _backup(board, folder)
-    remove = up.stale + (up.local if answer == REPLACE_MINE else [])
+    remove = up.stale + (up.local if answer == REPLACE_MINE else []) + up.remove_zones
     by_ref = {fp.reference_field.text.value: fp for fp in board.get_footprints()}
 
     tracks = []
@@ -282,6 +285,8 @@ def action_pull_changes() -> None:
         via.net = nets[v["net"]]
         vias.append(via)
 
+    zones = [_rule_area(z, snap.copper_layers) for z in up.add_zones]
+
     commit = board.begin_commit()
     try:
         if remove:
@@ -294,8 +299,8 @@ def action_pull_changes() -> None:
             moved.append(item)
         if moved:
             board.update_items(moved)
-        if tracks or vias:
-            board.create_items(tracks + vias)
+        if tracks or vias or zones:
+            board.create_items(tracks + vias + zones)
     except Exception:
         board.drop_commit(commit)
         raise
@@ -304,12 +309,51 @@ def action_pull_changes() -> None:
     kept = len(up.local) if answer != REPLACE_MINE else 0
     summary = (f"Moved {len(up.moves)} parts, added {len(tracks)} tracks and {len(vias)} vias, "
                f"removed {len(remove)} old tracks and vias" + (f", kept {kept} of the designer's" if kept else "")
-               + f" on {len(replace)} nets.")
+               + f" on {len(replace)} nets"
+               + (f", {len(zones)} keep-out areas added" if zones else "") + ".")
     say(f"BoardLab: applied \"{title}\". {summary} Ctrl+Z undoes it all. Backup: {backup}")
     for note in change.get("notes", []):
         say("  " + note)
     _call(link["server"], "POST", f"/api/v2/boards/{link['project_id']}/kicad/applied", token=link["token"],
-          body=_json({"title": title, "summary": summary, "client": _client_name(kicad)}))
+          body=_json({"title": title, "summary": summary, "client": _client_name(kicad),
+                      "changes": [c["id"] for c in change.get("changes", []) if c.get("id")]}))
+
+
+def _boardlab_zones(board) -> list[tuple[str, list, object]]:
+    """The board's zones that BoardLab named, as (name, outline in nm, item)."""
+    out = []
+    for z in board.get_zones():
+        name = z.name or ""
+        if not name.startswith(core.ZONE_MARK):
+            continue
+        try:
+            outline = [(n.point.x, n.point.y) for n in z.outline.outline.nodes if n.has_point]
+        except Exception:
+            outline = []
+        out.append((name, outline, z))
+    return out
+
+
+def _rule_area(z: dict, copper_layers: set[str]):
+    """A keep-out rule area from BoardLab's zone (``keepout``: what is allowed inside, False = kept out)."""
+    zone = Zone()
+    zone.proto.type = ZoneType.ZT_RULE_AREA
+    names = sorted(copper_layers) if z.get("layers", "*.Cu") == "*.Cu" else list(z["layers"])
+    zone.layers = [layer_from_canonical_name(n) for n in names]
+    poly = PolygonWithHoles()
+    for x, y in z["outline"]:
+        poly.outline.append(PolyLineNode.from_point(Vector2.from_xy(int(x), int(y))))
+    poly.outline.closed = True
+    zone.outline = poly
+    zone.name = z["name"]
+    allowed = z.get("keepout") or {}
+    ra = zone.proto.rule_area_settings
+    ra.keepout_tracks = not allowed.get("tracks", False)
+    ra.keepout_vias = not allowed.get("vias", False)
+    ra.keepout_pads = not allowed.get("pads", False)
+    ra.keepout_copper = not allowed.get("copperpour", False)
+    ra.keepout_footprints = not allowed.get("footprints", True)
+    return zone
 
 
 def action_pull_findings() -> None:
@@ -397,6 +441,100 @@ ACTIONS = {
 }
 
 
+# -- new versions (GET /plugins/latest, shared with the EasyEDA extension) ----------------------------
+
+UPDATE_NOW = "Update now"
+
+
+def _update_state_file() -> Path:
+    return launcher.config_dir() / "update.json"
+
+
+def _read_update_state() -> dict:
+    try:
+        return json.loads(_update_state_file().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_update_state(state: dict) -> None:
+    try:
+        path = _update_state_file()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(state, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _update_server() -> str:
+    """The server of the links (the newest one), else BOARDLAB_URL, else boardlab.it."""
+    links = sorted(_read_links().values(), key=lambda l: l.get("linked_at", 0))
+    return (links[-1]["server"] if links else os.environ.get("BOARDLAB_URL", DEFAULT_SERVER)).rstrip("/")
+
+
+def _fetch(url: str, timeout: float) -> bytes:
+    req = urllib.request.Request(url, headers={"User-Agent": f"BoardLab-Sync/{core.PLUGIN_VERSION} KiCad"})
+    with urllib.request.urlopen(req, timeout=timeout, context=_tls()) as resp:
+        return resp.read()
+
+
+def offer_update(*, force: bool = False) -> None:
+    """Once a day at most, ask the server for the newest plugin; when there is one the designer has
+    not put off, offer to install it in place. Never raises: an update check must not break KiCad."""
+    if os.environ.get("BOARDLAB_SYNC_NO_UPDATE_CHECK") or (
+            os.environ.get("BOARDLAB_SYNC_NO_DIALOG") and not os.environ.get("BOARDLAB_SYNC_ANSWER")):
+        return  # nobody to ask: never update unattended
+    try:
+        now = time.time()
+        state = _read_update_state()
+        if not force and not core.update_due(state, now):
+            return
+        server = _update_server()
+        latest = json.loads(_fetch(server + "/api/v2/plugins/latest", 5).decode("utf-8")).get("kicad") or {}
+        state.update(checked_at=now, latest=latest.get("version", ""))
+        _write_update_state(state)
+        if not core.should_offer(state["latest"], core.PLUGIN_VERSION, state, now):
+            return
+        answer = launcher.ask(f"BoardLab Sync {state['latest']} is available (you have {core.PLUGIN_VERSION}).\n\n"
+                              "Update now? The plugin replaces its own files; your boards and links are not "
+                              "touched. Cancel asks again tomorrow.", [UPDATE_NOW])
+        if answer != UPDATE_NOW:
+            state.update(snoozed_version=state["latest"], snoozed_until=now + core.UPDATE_SNOOZE_S)
+            _write_update_state(state)
+            return
+        launcher.alert(install_update(server, latest), ok=True)
+    except Exception as exc:
+        launcher.log(f"update check: {type(exc).__name__}: {exc}")
+
+
+def install_update(server: str, latest: dict) -> str:
+    """Download the package, check it, and write its plugin files over this folder (the one KiCad
+    installed the plugin in). The next button press runs the new code."""
+    here = Path(__file__).resolve().parent
+    data = _fetch(server + latest["download"], 120)
+    try:
+        files = core.package_files(data, latest.get("sha256"))
+    except ValueError as exc:
+        return f"BoardLab Sync was not updated: {exc}."
+    old_buttons = (here / "plugin.json").read_bytes() if (here / "plugin.json").exists() else b""
+    staging = here.parent / (here.name + ".update")
+    for rel, blob in files.items():  # everything written aside first: a failed write leaves the plugin as it was
+        dest = staging / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_bytes(blob)
+    for rel in files:
+        dest = here / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(staging / rel, dest)
+    import shutil
+    shutil.rmtree(staging, ignore_errors=True)
+    launcher.log(f"updated {core.PLUGIN_VERSION} -> {latest.get('version')} in {here}")
+    text = (f"BoardLab Sync is updated to {latest.get('version')}. The next button press uses it.")
+    if files.get("plugin.json") != old_buttons:
+        text += " Restart KiCad to see the new or renamed buttons."
+    return text
+
+
 def main(argv: list[str]) -> int:
     name = argv[1] if len(argv) > 1 else ""
     if name not in ACTIONS:
@@ -408,12 +546,15 @@ def main(argv: list[str]) -> int:
         if exc.code not in (None, 0):
             say(str(exc.code))
             launcher.alert(str(exc.code))  # KiCad itself only says "exited with code 1"
+            # A plugin too old for what BoardLab sent: look for the new one at once.
+            offer_update(force="update the plugin" in str(exc.code))
             return 1
     note = launcher.other_copy_note()
     if note:
         launcher.log(note)
     if _REPORT or note:
         launcher.alert("\n\n".join(["\n".join(_REPORT), note or ""]).strip(), ok=True)
+    offer_update()
     return 0
 
 
