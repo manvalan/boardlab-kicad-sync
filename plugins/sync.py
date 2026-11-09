@@ -96,9 +96,10 @@ def _tls() -> ssl.SSLContext:
 
 
 def _call(server: str, method: str, path: str, *, token: str | None = None, body: bytes | None = None,
-          content_type: str = "application/json", timeout: float = 120) -> dict:
+          content_type: str = "application/json", timeout: float = 120, raw: bool = False):
+    """The JSON answer, or its bytes with ``raw``."""
     req = urllib.request.Request(server.rstrip("/") + path, data=body, method=method)
-    req.add_header("Accept", "application/json")
+    req.add_header("Accept", "*/*" if raw else "application/json")
     req.add_header("User-Agent", f"BoardLab-Sync/1 KiCad ({platform.system()})")
     if body is not None:
         req.add_header("Content-Type", content_type)
@@ -106,7 +107,8 @@ def _call(server: str, method: str, path: str, *, token: str | None = None, body
         req.add_header("Authorization", "Bearer " + token)
     try:
         with urllib.request.urlopen(req, timeout=timeout, context=_tls()) as resp:
-            return json.loads(resp.read().decode("utf-8") or "{}")
+            data = resp.read()
+            return data if raw else json.loads(data.decode("utf-8") or "{}")
     except urllib.error.HTTPError as exc:
         try:
             detail = json.loads(exc.read().decode("utf-8")).get("detail")
@@ -230,6 +232,9 @@ def action_pull_changes() -> None:
     commit."""
     kicad, board = _board()
     link = _link_for(board)
+    if not list(board.get_footprints()):  # an empty board: the designer wants the whole project
+        _open_project(board, link)
+        return
     change = _call(link["server"], "GET", f"/api/v2/boards/{link['project_id']}/kicad/changeset", token=link["token"])
     snap = _snapshot(board)
     problems = core.check_changeset(change, snap)
@@ -317,6 +322,31 @@ def action_pull_changes() -> None:
     _call(link["server"], "POST", f"/api/v2/boards/{link['project_id']}/kicad/applied", token=link["token"],
           body=_json({"title": title, "summary": summary, "client": _client_name(kicad),
                       "changes": [c["id"] for c in change.get("changes", []) if c.get("id")]}))
+
+
+def _open_project(board, link: dict) -> None:
+    """"Update board" on an empty board: the project in use (board and schematic, from EasyEDA,
+    KiCad or anything else) is saved as a new KiCad project next to it, already linked; the empty
+    board is not touched (KiCad 10 lets a plugin edit the open board, not open another one)."""
+    data = _call(link["server"], "GET", f"/api/v2/boards/{link['project_id']}/kicad/project.zip",
+                 token=link["token"], raw=True, timeout=600)
+    try:
+        folder = Path(board.get_project().path)
+    except Exception:
+        folder = None
+    if not folder or not folder.is_dir():
+        folder = Path.home()
+    try:
+        pro = core.unpack_project(data, folder)
+    except ValueError as exc:
+        raise SystemExit(f"BoardLab: {exc}.") from None
+    new_board = pro.with_suffix(".kicad_pcb")
+    if new_board.exists():
+        _save_link(str(new_board), {k: v for k, v in link.items() if k != "applied"})
+    name = link.get("project_name") or link["project_id"]
+    say(f"BoardLab: \"{name}\" saved as a KiCad project in {pro.parent}. Open {pro.name} with "
+        "File > Open Project: its board is already linked. This empty board was not changed.")
+    webbrowser.open(pro.parent.as_uri())
 
 
 def _boardlab_zones(board) -> list[tuple[str, list, object]]:
