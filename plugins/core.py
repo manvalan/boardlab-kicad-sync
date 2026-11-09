@@ -14,7 +14,7 @@ from collections import Counter
 from pathlib import Path
 from dataclasses import dataclass, field
 
-PLUGIN_VERSION = "26.11.3"  # calendar versioning; the PCM package and GET /plugins/latest read it from here
+PLUGIN_VERSION = "26.11.4"  # calendar versioning; the PCM package and GET /plugins/latest read it from here
 PACKAGE_ID = "it.boardlab.sync"
 CHANGESET_FORMAT = "boardlab-kicad-changeset"
 FINDINGS_FORMAT = "boardlab-kicad-findings"
@@ -387,3 +387,38 @@ def package_files(data: bytes, expected_sha256: str | None = None) -> dict[str, 
     if "plugin.json" not in files or "sync.py" not in files:
         raise ValueError("the package has no plugin.json or sync.py: nothing was changed")
     return files
+
+
+def unpack_project(data: bytes, folder: Path) -> Path:
+    """Write the KiCad project BoardLab sent (a zip with one top folder ``<name>/``) into a new
+    folder under ``folder`` and return its ``.kicad_pro``. Nothing already on disk is overwritten:
+    when ``<name>`` exists the copy goes to ``<name>-2``, ``<name>-3``... Fail-closed: a damaged
+    zip, a path that leaves the folder or a zip without exactly one project file writes nothing."""
+    try:
+        zf = zipfile.ZipFile(io.BytesIO(data))
+    except zipfile.BadZipFile:
+        raise ValueError("BoardLab did not send a KiCad project: nothing was written") from None
+    files: dict[str, bytes] = {}
+    tops = set()
+    for name in zf.namelist():
+        if name.endswith("/"):
+            continue
+        parts = name.split("/")
+        if (name.startswith("/") or "\\" in name or len(parts) < 2
+                or any(p in ("", ".", "..") for p in parts) or ":" in name):
+            raise ValueError(f"the project has an unsafe path ({name}): nothing was written")
+        tops.add(parts[0])
+        files["/".join(parts[1:])] = zf.read(name)
+    projects = [n for n in files if "/" not in n and n.endswith(".kicad_pro")]
+    if len(tops) != 1 or len(projects) != 1:
+        raise ValueError("BoardLab sent no KiCad project file: nothing was written")
+    top = tops.pop()
+    target, n = folder / top, 1
+    while target.exists():
+        n += 1
+        target = folder / f"{top}-{n}"
+    for rel, blob in files.items():
+        path = target.joinpath(*rel.split("/"))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(blob)
+    return target / projects[0]
